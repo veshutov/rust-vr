@@ -1,5 +1,5 @@
 use std::env;
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 use anyhow::Result;
 use axum::{Router, extract::Json, extract::State, routing::post};
@@ -7,7 +7,7 @@ use tokio::io::{self, AsyncBufReadExt, BufReader};
 use tokio::sync::Mutex;
 
 use crate::client::VrClient;
-use crate::replica::{ClientRequest, ServerResponse, VrReplica};
+use crate::replica::{ClientRequest, PrepareRequest, PrepareResponse, ServerResponse, VrReplica};
 
 mod client;
 mod replica;
@@ -50,7 +50,7 @@ async fn main() -> Result<()> {
 
                 match client.send(line.clone()).await {
                     Ok(_) => {}
-                    Err(e) => println!("Error response: {}", e),
+                    Err(e) => println!("Client {}: error response: {}", client_id, e),
                 }
             }
         }
@@ -81,7 +81,8 @@ async fn main() -> Result<()> {
                 replica: Arc::new(Mutex::new(replica)),
             });
             let app = Router::new()
-                .route("/", post(process_request))
+                .route("/", post(process_client_request))
+                .route("/prepare", post(process_prepare_request))
                 .with_state(app_state);
 
             let listener = tokio::net::TcpListener::bind(format!(
@@ -104,7 +105,11 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn process_request(
+struct AppState {
+    pub replica: Arc<Mutex<VrReplica>>,
+}
+
+async fn process_client_request(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<ClientRequest>,
 ) -> Json<ServerResponse> {
@@ -113,8 +118,11 @@ async fn process_request(
     Json(response)
 }
 
-struct AppState {
-    pub replica: Arc<Mutex<VrReplica>>,
+async fn process_prepare_request(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<PrepareRequest>,
+) -> Json<PrepareResponse> {
+    let mut replica = state.replica.lock().await;
+    let response = replica.process_prepare_message(payload).await;
+    Json(response)
 }
-
-unsafe impl Send for AppState {}

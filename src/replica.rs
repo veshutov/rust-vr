@@ -1,8 +1,12 @@
 use std::collections::HashMap;
 
+use anyhow::Result;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use tokio::fs;
+use tokio::{
+    fs::{self, OpenOptions},
+    io::AsyncWriteExt,
+};
 
 #[derive(Clone, Debug)]
 pub enum ReplicaStatus {
@@ -29,30 +33,30 @@ pub struct ServerResponse {
 pub struct PrepareRequest {
     pub view_number: usize,
     pub client_request: ClientRequest,
-    pub operation_number: u64,
-    pub commit_number: u64,
+    pub operation_number: usize,
+    pub commit_number: usize,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PrepareResponse {
     pub view_number: usize,
-    pub operation_number: u64,
+    pub operation_number: usize,
     pub replica_number: usize,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CommitRequest {
     pub view_number: usize,
-    pub commit_number: u64,
+    pub commit_number: usize,
 }
 
 pub struct VrReplica {
     pub replica_number: usize,
     pub view_number: usize,
     pub status: ReplicaStatus,
-    pub operation_number: u64,
+    pub operation_number: usize,
     pub log: Vec<ClientRequest>,
-    pub commit_number: u64,
+    pub commit_number: usize,
     pub client_table: HashMap<String, ClientState>,
     pub replica_urls: Vec<String>,
     pub client: Client,
@@ -89,7 +93,7 @@ impl VrReplica {
         client_request: ClientRequest,
     ) -> ServerResponse {
         println!(
-            "Replica {}: received client request {:?}",
+            "Replica {}: received {:?}",
             self.replica_number, client_request
         );
 
@@ -124,7 +128,7 @@ impl VrReplica {
                     }
                 } else {
                     println!(
-                        "Replica {}: is not primary, dropping {:?}",
+                        "Replica {}: already executed {:?}",
                         self.replica_number, client_request
                     );
                     ServerResponse {
@@ -156,7 +160,7 @@ impl VrReplica {
             commit_number: self.commit_number,
         };
 
-        self.send_prepare_message_to_replicas(prepare);
+        self.send_prepare_message_to_replicas(prepare).await;
 
         // wait for f+1 responses etc. (skipped for simplicity)
         let result = self.execute_operation(&client_request.operation).await;
@@ -177,22 +181,31 @@ impl VrReplica {
         }
     }
 
-    fn send_prepare_message_to_replicas(&self, prepare_request: PrepareRequest) {
-        // for s in self
-        //     .servers
-        //     .iter()
-        //     .filter(|s| s.borrow().replica_number != self.replica_number)
-        // {
-        //     s.borrow_mut()
-        //         .process_prepare_message(prepare_request.clone());
-        // }
+    async fn send_prepare_message_to_replicas(&self, prepare_request: PrepareRequest) {
+        for (replica_number, replica_url) in self.replica_urls.iter().enumerate() {
+            if (replica_number != self.replica_number) {
+                let _: PrepareResponse = self
+                    .client
+                    .post(format!("{}/prepare", replica_url))
+                    .json(&prepare_request)
+                    .send()
+                    .await
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap();
+            }
+        }
     }
 
     pub async fn process_prepare_message(
         &mut self,
         prepare_request: PrepareRequest,
     ) -> PrepareResponse {
-        println!("Received PREPARE request: {:?}", prepare_request);
+        println!(
+            "Replica {}: received {:?}",
+            self.replica_number, prepare_request
+        );
 
         if prepare_request.commit_number > 0 {
             let commit = CommitRequest {
@@ -202,9 +215,12 @@ impl VrReplica {
             self.process_commit_message(commit).await;
         }
 
-        if self.log.len() as u64 + 1 < prepare_request.operation_number {
+        if self.log.len() + 1 < prepare_request.operation_number {
             // missing operations - need sync
-            println!("Missing operations, need sync");
+            println!(
+                "Replica {}: missing operations, need sync",
+                self.replica_number
+            );
         }
 
         self.operation_number += 1;
@@ -219,7 +235,7 @@ impl VrReplica {
 
         PrepareResponse {
             view_number: self.view_number,
-            operation_number: self.operation_number,
+            operation_number: prepare_request.operation_number,
             replica_number: self.replica_number,
         }
     }
@@ -236,34 +252,42 @@ impl VrReplica {
     }
 
     pub async fn process_commit_message(&mut self, commit_request: CommitRequest) {
-        println!("Received COMMIT request: {:?}", commit_request);
+        println!(
+            "Replica {}: received {:?}",
+            self.replica_number, commit_request
+        );
 
-        if self.log.len() as u64 + 1 < commit_request.commit_number {
-            println!("Missing operations, need sync");
-        }
-
-        if let Some(client_request) = self
-            .log
-            .get((commit_request.commit_number - 1) as usize)
-            .cloned()
-        {
-            let result = self.execute_operation(&client_request.operation).await;
-            self.commit_number += 1;
-
-            self.client_table.insert(
-                client_request.client_id.clone(),
-                ClientState {
-                    last_request_number: client_request.request_number,
-                    result: Some(result),
-                },
+        if self.log.len() < commit_request.commit_number {
+            println!(
+                "Replica {}: missing operations, need sync",
+                self.replica_number
             );
         }
+
+        let client_request = self.log.get(commit_request.commit_number - 1).unwrap();
+        let result = self.execute_operation(&client_request.operation).await;
+
+        self.commit_number += 1;
+        self.client_table.insert(
+            client_request.client_id.clone(),
+            ClientState {
+                last_request_number: client_request.request_number,
+                result: Some(result),
+            },
+        );
     }
 
     async fn execute_operation(&self, operation: &str) -> String {
-        fs::write(format!("replica-{}.txt", self.replica_number), operation)
+        let file_path = format!("replica-{}.txt", self.replica_number);
+        let mut file = OpenOptions::new()
+            .write(true)
+            .append(true)
+            .create(true)
+            .open(file_path)
             .await
             .unwrap();
+
+        file.write(&operation.as_bytes()).await.unwrap();
         return format!("executed {}", operation);
     }
 }
